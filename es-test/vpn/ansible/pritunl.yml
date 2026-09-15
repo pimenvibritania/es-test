@@ -81,11 +81,11 @@
       delay: 10
       until: pritunl_ready.status is defined and pritunl_ready.status in [200, 302, 401]
 
-    - name: Show how to retrieve the default admin password
+    - name: Show how to finish setup
       debug:
         msg: >
-          Pritunl is installed and running. SSH/SSM into this instance and run
-          `pritunl default-password` to get the initial admin credentials, then
-          log into https://<this-instance-public-ip>/ to finish setup
-          (change password, create org + user, download .ovpn profile).
-          This step is intentionally manual -- see ../README.md for why.
+          Pritunl is installed and running. Run pritunl-provision.yml next
+          for a fully automated bootstrap (fixes the mongodb_uri config,
+          resets the admin password, enables the REST API, creates the
+          Organization/Server/User, and downloads the client .ovpn profile
+          into Vault) -- no manual UI step required. See ../README.md.

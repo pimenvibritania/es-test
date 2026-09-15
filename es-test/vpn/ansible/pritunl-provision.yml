@@ -1,0 +1,181 @@
+---
+# Fully-automated Pritunl bootstrap: fixes the empty mongodb_uri bug left by
+# pritunl.yml, resets the admin password, enables the REST API, and then
+# provisions Organization/Server/User + downloads the client .ovpn profile
+# entirely through the Pritunl API (no browser, no manual UI step).
+#
+# Everything here is idempotent and safe to re-run. Credentials/secrets are
+# never printed to stdout/logs (no_log: true on every task that touches
+# one) and are written straight into Vault, never left on disk.
+#
+# Prerequisites:
+#   - pritunl.yml has already installed+started Pritunl/MongoDB on the vpn
+#     host (this playbook only fixes config/bootstraps app-level state).
+#   - Security group for the vpn host already allows the chosen VPN port
+#     (udp/{{ pritunl_server_port }}) and the admin UI port (tcp/443) --
+#     see vpn/terraform.
+#   - VAULT_ADDR / VAULT_TOKEN exported in the environment running ansible
+#     (this repo assumes a local HashiCorp Vault reachable from the control
+#     node; adjust the "Store in Vault" tasks if you use a different Vault
+#     deployment/auth method).
+#
+# Run:
+#   export VAULT_ADDR=http://127.0.0.1:8200
+#   export VAULT_TOKEN=<root or a token with write on kv/pritunl>
+#   ansible-playbook -i inventory.ini pritunl-provision.yml
+
+- name: Bootstrap Pritunl app state (mongodb fix, password, API) via SSM
+  hosts: vpn
+  become: true
+  gather_facts: false
+  vars:
+    pritunl_org_name: es-test-org
+    pritunl_server_name: es-test-vpn-server
+    pritunl_server_port: 1194
+    pritunl_server_protocol: udp
+    pritunl_server_network: 192.168.99.0/24
+    pritunl_user_name: es-test-client
+
+  tasks:
+    # --- Bug fix: pritunl.yml installs mongod+pritunl but the package's
+    # first-boot default leaves mongodb_uri empty in /etc/pritunl.conf,
+    # which makes every admin/API operation fail even though both
+    # services report "running". Confirmed via `pritunl get-mongodb`
+    # returning empty. Fix is idempotent (pritunl set-mongodb is safe to
+    # re-run with the same value).
+    - name: Ensure Pritunl's mongodb_uri points at the local mongod
+      command: pritunl set-mongodb mongodb://localhost:27017/pritunl
+      changed_when: true
+
+    - name: Restart pritunl to pick up the mongodb_uri fix
+      systemd:
+        name: pritunl
+        state: restarted
+
+    - name: Wait for Pritunl web UI to come back up
+      uri:
+        url: "https://localhost/"
+        validate_certs: false
+        status_code: [200, 302, 401]
+      register: pritunl_ready
+      retries: 12
+      delay: 5
+      until: pritunl_ready.status is defined and pritunl_ready.status in [200, 302, 401]
+
+    - name: Generate a new random admin password
+      set_fact:
+        pritunl_new_password: "{{ lookup('community.general.random_string', length=16, special=false) }}"
+      no_log: true
+
+    # NB: the default/super_user admin account is named "pritunl", not
+    # "admin" -- confirmed via `db.administrators.find()`.
+    - name: Reset the Pritunl admin password
+      command: "pritunl reset-password pritunl"
+      register: pritunl_reset_out
+      no_log: true
+      changed_when: true
+
+    # `pritunl reset-password` always generates its own random password and
+    # prints it -- we capture that instead of trying to force our own value,
+    # since there's no `pritunl set-password <value>` subcommand.
+    - name: Extract the generated admin password
+      set_fact:
+        pritunl_admin_password: "{{ pritunl_reset_out.stdout | regex_search('password: (\\S+)', '\\1') | first }}"
+      no_log: true
+
+    # --- Enable REST API auth for the admin account. There is no CLI
+    # subcommand for this (confirmed: `pritunl --help` only exposes
+    # password/db-config/reset-network operations) -- the only way in is a
+    # direct MongoDB update. This is deliberately narrow ($set: auth_api on
+    # the single default admin) to avoid touching anything else in the doc.
+    - name: Enable REST API auth for the admin account (no CLI equivalent)
+      command: >
+        mongosh --quiet pritunl --eval
+        "db.administrators.updateOne({username:'pritunl'},{$set:{auth_api:true}})"
+      changed_when: true
+
+    - name: Read back the admin API token/secret for use by the provisioning script
+      command: >
+        mongosh --quiet pritunl --eval
+        "JSON.stringify(db.administrators.findOne({username:'pritunl'},{token:1,secret:1}))"
+      register: pritunl_admin_creds_raw
+      no_log: true
+      changed_when: false
+
+    - name: Parse the API token/secret
+      set_fact:
+        pritunl_api_token: "{{ (pritunl_admin_creds_raw.stdout | from_json).token }}"
+        pritunl_api_secret: "{{ (pritunl_admin_creds_raw.stdout | from_json).secret }}"
+      no_log: true
+
+- name: Provision Pritunl organization/server/user via REST API
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    pritunl_base_url: "https://{{ hostvars[groups['vpn'][0]].public_ip }}"
+    pritunl_org_name: "{{ hostvars[groups['vpn'][0]].pritunl_org_name | default('es-test-org') }}"
+    pritunl_server_name: "{{ hostvars[groups['vpn'][0]].pritunl_server_name | default('es-test-vpn-server') }}"
+    pritunl_server_port: "{{ hostvars[groups['vpn'][0]].pritunl_server_port | default(1194) }}"
+    pritunl_server_protocol: "{{ hostvars[groups['vpn'][0]].pritunl_server_protocol | default('udp') }}"
+    pritunl_server_network: "{{ hostvars[groups['vpn'][0]].pritunl_server_network | default('192.168.99.0/24') }}"
+    pritunl_user_name: "{{ hostvars[groups['vpn'][0]].pritunl_user_name | default('es-test-client') }}"
+
+  tasks:
+    # Requires `python3 -m pip install --break-system-packages requests`
+    # on the control node -- listed in ../README.md prerequisites.
+    - name: Run the Pritunl API provisioning script (org/server/user/profile)
+      command: python3 files/pritunl_provision.py
+        --base-url "{{ pritunl_base_url }}"
+        --org-name "{{ pritunl_org_name }}"
+        --server-name "{{ pritunl_server_name }}"
+        --server-port "{{ pritunl_server_port }}"
+        --server-protocol "{{ pritunl_server_protocol }}"
+        --server-network "{{ pritunl_server_network }}"
+        --user-name "{{ pritunl_user_name }}"
+      environment:
+        PRITUNL_API_TOKEN: "{{ hostvars[groups['vpn'][0]].pritunl_api_token }}"
+        PRITUNL_API_SECRET: "{{ hostvars[groups['vpn'][0]].pritunl_api_secret }}"
+      register: pritunl_provision_out
+      no_log: true
+      changed_when: true
+
+    - name: Parse provisioning script output
+      set_fact:
+        pritunl_provision_result: "{{ pritunl_provision_out.stdout | from_json }}"
+      no_log: true
+
+    # --- Persist everything to Vault. Assumes a local Vault reachable at
+    # $VAULT_ADDR with a KV v2 mount at kv/, using $VAULT_TOKEN for auth
+    # (see ../../README.md -- this repo's dev Vault is a docker-compose
+    # HashiCorp Vault, not part of the AWS infra being tested).
+    - name: Store Pritunl credentials + VPN profile in Vault (kv/pritunl)
+      uri:
+        url: "{{ lookup('env', 'VAULT_ADDR') }}/v1/kv/data/pritunl"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ lookup('env', 'VAULT_TOKEN') }}"
+        body_format: json
+        body:
+          data:
+            admin_user: pritunl
+            admin_password: "{{ hostvars[groups['vpn'][0]].pritunl_admin_password }}"
+            admin_url: "{{ pritunl_base_url }}/"
+            api_token: "{{ hostvars[groups['vpn'][0]].pritunl_api_token }}"
+            api_secret: "{{ hostvars[groups['vpn'][0]].pritunl_api_secret }}"
+            org_id: "{{ pritunl_provision_result.org_id }}"
+            server_id: "{{ pritunl_provision_result.server_id }}"
+            user_id: "{{ pritunl_provision_result.user_id }}"
+            ovpn_profile_b64: "{{ pritunl_provision_result.ovpn_profile_b64 }}"
+            vpn_public_ip: "{{ hostvars[groups['vpn'][0]].public_ip }}"
+        status_code: [200, 204]
+        validate_certs: false
+      no_log: true
+
+    - name: Done
+      debug:
+        msg: >
+          Pritunl fully provisioned: organization/server/user created,
+          server started, .ovpn profile generated, and all credentials
+          stored in Vault at kv/pritunl. Retrieve the client profile with:
+          `vault kv get -field=ovpn_profile_b64 kv/pritunl | base64 -d > client.ovpn`
