@@ -170,3 +170,36 @@ A **full destroy → recreate cycle from zero** (not merely a resume of existing
 - SNS email subscription: confirmed (AWS reused the existing confirmed subscription for the same email address).
 
 This confirms the delivered code is self-sufficient and reproducible from a completely empty AWS account state, with zero manual remediation steps beyond the one AWS-mandated SNS email confirmation.
+
+---
+
+## 11. How to provision (setup)
+
+### 11.1 Prerequisites (one-time)
+1. AWS credentials with `AdministratorAccess` (or an equivalent least-privilege policy covering VPC/EC2/IAM/KMS/SecretsManager/CloudWatch/SNS/S3/SSM) for the target account.
+2. `terraform`, `ansible`, `aws` CLI, and the AWS `session-manager-plugin` installed locally. `es-test/deploy.sh` and its siblings assume these are already on `PATH`.
+3. No SSH keypair is required anywhere — all in-instance access goes through AWS SSM Session Manager.
+
+### 11.2 Provisioning flow (per stack)
+Every stack (`es-test/`, `es-test/vpn/`, `es-test/monitoring/`, `es-test/alerting/`) follows the **same 3-step, fully-automated pattern**, driven by that stack's own `deploy.sh`:
+
+1. **`terraform init` + `terraform apply`** — creates/updates all AWS resources for that stack (VPC, EC2, IAM, KMS, Secrets Manager, CloudWatch, SNS, S3, etc., depending on the stack). Downstream stacks (vpn/monitoring/alerting) read the upstream stack's outputs via `terraform_remote_state`, so they must be applied *after* their dependency, never before.
+2. **Auto-generate the Ansible inventory** — a short inline Python block reads `terraform output -json` from the stack just applied (plus any upstream stack outputs it needs, e.g. monitoring reads both its own VPN/Kibana outputs and the ES stack's node IPs) and writes `ansible/inventory.ini` directly — no manual editing of an inventory file ever happens.
+3. **`ansible-playbook`** — configures the software on the instance(s) just created (install ElasticSearch/Pritunl/Kibana, generate/rotate certs and passwords, write config, install a cron job, etc.), connecting exclusively via `ansible_connection=community.aws.aws_ssm` (no SSH). Each `deploy.sh` polls `aws ssm describe-instance-information` in a loop first, since a brand-new instance takes ~60-90s to register with SSM before Ansible can reach it, and retries the playbook run up to 3 times to absorb an SSM connection race observed in testing.
+
+### 11.3 Provisioning order (must be sequential)
+```
+1. es-test/           deploy.sh <allowed_cidr>        (ElasticSearch, 3 nodes)
+2. es-test/vpn/        deploy.sh <admin_cidr>          (Pritunl VPN — reads ES state)
+3. es-test/monitoring/ deploy.sh                       (Kibana — reads ES + VPN state)
+4. es-test/alerting/   deploy.sh <alert_email>         (CloudWatch + SNS — reads ES state)
+```
+Destroy order is the exact reverse (alerting → monitoring → vpn → es-test), since each stack's Terraform state depends on the one before it via `terraform_remote_state`.
+
+For convenience, `~/vault/recreate-all.sh` on the operator's machine runs all 4 stacks in the correct order in a single command (used to validate a full destroy→recreate cycle from an empty AWS account in this session — see Section 10).
+
+### 11.4 One manual step per stack (unavoidable, not a shortcut)
+- **Alerting stack**: after `deploy.sh` finishes, AWS emails a Subscription Confirmation link to the alert email address — the alarm pipeline will not actually deliver notifications until that link is clicked. There is no AWS API to auto-confirm an SNS email subscription without owning the mailbox.
+- **VPN stack**: the very first Pritunl admin login (setting the initial admin password, creating an org/user, downloading the `.ovpn` profile) is done once through the Pritunl web UI after `deploy.sh` finishes and prints the public IP + a `sudo pritunl default-password` hint. Pritunl's own workflow is designed around this being a human action.
+
+Everything else — infra creation, software install, TLS cert generation, password generation/rotation, cron jobs, alarm/topic wiring — is fully automated end-to-end with zero manual steps.

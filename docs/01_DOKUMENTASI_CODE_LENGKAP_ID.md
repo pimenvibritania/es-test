@@ -1,6 +1,6 @@
 # Dokumentasi Lengkap Code — es-test (3-Node ElasticSearch Cluster + VPN + Monitoring + Alerting)
 
-Dokumen ini menjelaskan **seluruh kode**, baris per baris (per-blok logika), dari proyek take-home test Infrastructure Engineer. Nama folder proyek adalah `es-test/` (sebelumnya bernama `paid-tier/`, di-rename untuk submission final — sebuah folder draft awal `free-tier/` yang lebih sederhana sudah diarsipkan ke `_archived_free-tier/` dan tidak lagi jadi bagian dari deliverable). Struktur proyek dibagi menjadi 4 stack independen yang saling bergantung secara berurutan:
+Dokumen ini menjelaskan **seluruh kode**, baris per baris (per-blok logika), dari proyek take-home test Infrastructure Engineer. Nama folder proyek adalah `es-test/`. Struktur proyek dibagi menjadi 4 stack independen yang saling bergantung secara berurutan:
 
 ## Ringkasan Free vs Paid (penting untuk reviewer)
 
@@ -245,3 +245,36 @@ Pola sama di semua 4 file:
 5. Ditambahkan **safety net permanen**: task verifikasi auth eksplisit dengan retry & fail-loud, agar kelas bug serupa di masa depan (karakter spesial apapun) langsung ketahuan saat deploy, bukan belakangan.
 
 Semua fix di atas sudah divalidasi ulang lewat **full destroy → recreate dari nol**, bukan hanya resume idempotent — hasil akhir: ES cluster green 3/3 node, Kibana HTTP 200, verifikasi auth `kibana_system` lolos otomatis tanpa intervensi manual apapun (kecuali klik link konfirmasi email SNS, yang merupakan limitasi AWS API, bukan limitasi kode).
+
+---
+
+## Cara Provisioning (Setup)
+
+### Prasyarat (sekali saja)
+1. AWS credential dengan `AdministratorAccess` (atau policy least-privilege yang cover VPC/EC2/IAM/KMS/SecretsManager/CloudWatch/SNS/S3/SSM) untuk akun target.
+2. `terraform`, `ansible`, `aws` CLI, dan `session-manager-plugin` (AWS SSM) sudah terinstall lokal dan ada di `PATH`.
+3. **Tidak perlu SSH keypair sama sekali** — semua akses ke instance lewat AWS SSM Session Manager, port 22 tidak pernah dibuka.
+
+### Flow Provisioning (per stack)
+Keempat stack (`es-test/`, `es-test/vpn/`, `es-test/monitoring/`, `es-test/alerting/`) mengikuti **pola 3-langkah yang identik dan fully-automated**, dijalankan lewat `deploy.sh` masing-masing stack:
+
+1. **`terraform init` + `terraform apply`** — membuat/update semua resource AWS untuk stack tersebut (VPC, EC2, IAM, KMS, Secrets Manager, CloudWatch, SNS, S3, dst., tergantung stack). Stack turunan (vpn/monitoring/alerting) membaca output stack sebelumnya lewat `terraform_remote_state`, jadi urutan apply **wajib** sesuai dependency, tidak bisa dibalik.
+2. **Generate inventory Ansible otomatis** — blok Python inline membaca `terraform output -json` dari stack yang baru di-apply (plus output stack upstream yang dibutuhkan, misal monitoring butuh output VPN+ES) lalu menulis langsung `ansible/inventory.ini` — **tidak ada edit manual file inventory sama sekali**.
+3. **`ansible-playbook`** — konfigurasi software di instance yang baru dibuat (install ElasticSearch/Pritunl/Kibana, generate/rotate cert & password, tulis config, install cron job, dst.), koneksi eksklusif lewat `ansible_connection=community.aws.aws_ssm` (bukan SSH). Setiap `deploy.sh` polling `aws ssm describe-instance-information` dulu (instance baru butuh ~60-90 detik untuk register ke SSM sebelum bisa dijangkau Ansible), dan retry playbook run sampai 3x untuk menoleransi race condition SSM yang ditemukan saat testing.
+
+### Urutan Provisioning (wajib berurutan)
+```
+1. es-test/           deploy.sh <allowed_cidr>        (ElasticSearch, 3 node)
+2. es-test/vpn/        deploy.sh <admin_cidr>          (Pritunl VPN — baca state ES)
+3. es-test/monitoring/ deploy.sh                       (Kibana — baca state ES + VPN)
+4. es-test/alerting/   deploy.sh <alert_email>         (CloudWatch + SNS — baca state ES)
+```
+Urutan **destroy** adalah kebalikan persis (alerting → monitoring → vpn → es-test), karena Terraform state setiap stack bergantung ke stack sebelumnya lewat `terraform_remote_state`.
+
+Sebagai shortcut, `~/vault/recreate-all.sh` di sisi operator menjalankan keempat stack sekaligus dalam urutan yang benar via satu command (dipakai untuk memvalidasi full destroy→recreate dari akun AWS kosong pada sesi ini).
+
+### Satu langkah manual per stack (tidak terhindarkan, bukan shortcut yang disengaja)
+- **Stack alerting**: setelah `deploy.sh` selesai, AWS mengirim email Subscription Confirmation link ke alamat email alert — pipeline alarm belum akan mengirim notifikasi apapun sampai link itu diklik. Tidak ada AWS API untuk auto-confirm subscription SNS email tanpa memiliki akses ke mailbox tersebut.
+- **Stack VPN**: login admin Pritunl pertama kali (set password admin awal, buat org/user, download profile `.ovpn`) dilakukan sekali lewat web UI Pritunl setelah `deploy.sh` selesai dan mencetak public IP + hint `sudo pritunl default-password`. Workflow Pritunl sendiri memang didesain untuk langkah ini dilakukan manusia.
+
+Selain dua hal di atas, **semuanya** — pembuatan infra, install software, generate cert TLS, generate/rotasi password, cron job, wiring alarm/topic — fully automated end-to-end tanpa langkah manual apapun.
