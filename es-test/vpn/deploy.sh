@@ -3,7 +3,7 @@
 # terraform apply (infra, reads ES remote state) -> auto-generated Ansible
 # inventory -> ansible-playbook (Pritunl install/config).
 #
-# PREREQUISITE: ../../terraform (paid-tier ES cluster) must already be applied.
+# PREREQUISITE: ../../terraform (es-test ES cluster) must already be applied.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

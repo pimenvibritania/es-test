@@ -1,50 +1,50 @@
 # Infrastructure Engineer Take-Home — Secure ElasticSearch on AWS (Free Tier)
 
-> DRAFT — brainstorm output, belum diimplementasikan/dites. Semua nilai cost adalah ASSUMPTION berbasis harga publik AWS us-east-1, bisa beda per region/waktu — cek AWS Pricing Calculator sebelum submit.
+> DRAFT — brainstorm output, not yet implemented/tested at the time this was written. All cost figures are ASSUMPTIONS based on public AWS us-east-1 pricing, and may vary by region/time — check the AWS Pricing Calculator before submitting.
 
-## 1. Ringkasan Solusi
+## 1. Solution Summary
 
-Deploy 1x EC2 instance (t2.micro/t3.micro, free tier) menjalankan ElasticSearch single-node dengan:
-- Autentikasi wajib (X-Pack Security)
-- Komunikasi terenkripsi (TLS di HTTP layer 9200)
-- Akses admin via AWS SSM Session Manager (tanpa port 22 terbuka)
-- Security Group least-privilege (9200 hanya dari IP tertentu, bukan 0.0.0.0/0)
+Deploy 1x EC2 instance (t2.micro/t3.micro, free tier) running single-node ElasticSearch with:
+- Mandatory authentication (X-Pack Security)
+- Encrypted communication (TLS on the HTTP layer, port 9200)
+- Admin access via AWS SSM Session Manager (no port 22 open)
+- Least-privilege Security Group (9200 only from a specific IP, not 0.0.0.0/0)
 
-Provisioning: Terraform (infra) + user-data/Ansible (config ES).
-Didesain **extensible ke 3-node cluster** — lihat Bagian 4.
+Provisioning: Terraform (infra) + user-data/Ansible (ES config).
+Designed to be **extensible to a 3-node cluster** — see Section 4.
 
-## 2. Kenapa pilihan ini (jawaban pertanyaan take-home)
+## 2. Why these choices (take-home question answers)
 
-### Q1: Tool provisioning & bootstrapping — kenapa?
-- **Terraform** untuk infra (VPC, SG, EC2, IAM role, EBS) — deklaratif, state-tracked, mudah destroy/recreate bersih (penting untuk exercise yang bakal di-cleanup setelah demo).
-- **User-data script / Ansible** untuk install & config ES — idempotent, mudah dibaca reviewer, dan Ansible lebih natural untuk "config management" dibanding menaruh semuanya di Terraform provisioner.
+### Q1: Provisioning & bootstrapping tool — why?
+- **Terraform** for infra (VPC, SG, EC2, IAM role, EBS) — declarative, state-tracked, easy to cleanly destroy/recreate (important for an exercise that will be cleaned up after the demo).
+- **User-data script / Ansible** for installing & configuring ES — idempotent, easy for a reviewer to read, and Ansible is more natural for "config management" than putting everything into a Terraform provisioner.
 
-### Q2: Cara mengamankan ElasticSearch — kenapa?
-- `xpack.security.enabled: true` — built-in ES, tidak perlu proxy tambahan (mis. nginx basic-auth) yang justru nambah attack surface & maintenance.
-- TLS self-signed via `elasticsearch-certutil` untuk HTTP layer — cukup untuk internal/demo; production sebaiknya certs dari CA terpercaya/ACM Private CA (ditulis sebagai catatan, bukan diimplementasikan — ASSUMPTION di luar scope free-tier exercise).
-- Password built-in user (`elastic`) disimpan di **SSM Parameter Store SecureString** (KMS AWS-managed key), di-fetch instance via IAM role saat bootstrap — bukan hardcoded di script/repo (risk area: **secrets management**).
-- Security Group membatasi akses port 9200 hanya dari IP pengetes (my-IP), bukan publik (risk area: **access control**).
+### Q2: How to secure ElasticSearch — why?
+- `xpack.security.enabled: true` — built into ES, no need for an extra proxy (e.g. nginx basic-auth) that would only add attack surface & maintenance burden.
+- Self-signed TLS via `elasticsearch-certutil` for the HTTP layer — sufficient for internal/demo use; production should use certs from a trusted CA/ACM Private CA (noted here, not implemented — an ASSUMPTION outside the scope of this free-tier exercise).
+- The built-in user's (`elastic`) password is stored in **SSM Parameter Store SecureString** (AWS-managed KMS key), fetched by the instance via IAM role at bootstrap — not hardcoded in scripts/repo (risk area: **secrets management**).
+- Security Group restricts port 9200 access to only the tester's IP (my-IP), not public (risk area: **access control**).
 
-### Q3: Monitoring — metric apa?
-Lihat Bagian 3.
+### Q3: Monitoring — which metrics?
+See Section 3.
 
-### Q4: Extend ke cluster 3-node aman — apa yang berubah?
-Lihat Bagian 4.
+### Q4: Extending to a secure 3-node cluster — what changes?
+See Section 4.
 
-### Q5: Replace node running tanpa/minim downtime
+### Q5: Replacing a running node with zero/minimal downtime
 1. `PUT _cluster/settings {"transient":{"cluster.routing.allocation.enable":"none"}}` — freeze shard allocation.
-2. Stop ES di node target, lakukan replace/patch/upgrade.
-3. Start ES kembali, node rejoin cluster.
+2. Stop ES on the target node, perform replace/patch/upgrade.
+3. Start ES again, node rejoins the cluster.
 4. `PUT _cluster/settings {"transient":{"cluster.routing.allocation.enable":"all"}}`.
-5. Tunggu `_cluster/health` kembali **green** sebelum lanjut ke node berikutnya (rolling, satu-satu, tidak paralel).
+5. Wait for `_cluster/health` to return to **green** before moving to the next node (rolling, one at a time, not in parallel).
 
-### Q6: Struktur kode rapi/extensible/reusable — prioritas?
-Ya — Terraform dipisah per module (network, compute, security) dan pakai variable/count agar tinggal ubah `node_count` untuk scale 1→3 node, bukan copy-paste script.
+### Q6: Clean/extensible/reusable code structure — priority?
+Yes — Terraform is split into modules (network, compute, security) and uses variables/count so scaling from 1→3 nodes only requires changing `node_count`, not copy-pasting scripts.
 
-### Q7: Trade-off karena keterbatasan resource (bukan waktu, tapi biaya free-tier)
-- Implementasi **1-node** untuk demo real (agar $0 cost), 3-node didokumentasikan sebagai extension path — karena 3x EC2 24/7 + NAT Gateway di luar free tier (lihat tabel cost).
-- Pakai **public subnet + SG ketat** alih-alih private subnet + NAT Gateway, karena NAT Gateway (~$32/bulan) adalah biaya terbesar yang bisa dihindari tanpa mengorbankan keamanan inti (TLS+auth tetap wajib, SG tetap restrict ke my-IP).
-- Pakai AWS-managed KMS key (gratis) alih-alih customer-managed CMK ($1/bulan), karena kebutuhan audit granular per-key tidak proporsional untuk exercise ini.
+### Q7: Trade-offs due to resource constraints (not time, but free-tier cost limits)
+- Implemented as a **1-node** cluster for the real demo (to keep cost at $0), with the 3-node setup documented as an extension path — since 3x EC2 running 24/7 plus a NAT Gateway falls outside the free tier (see cost table).
+- Used a **public subnet + strict SG** instead of a private subnet + NAT Gateway, since the NAT Gateway (~$32/month) is the largest avoidable cost without sacrificing core security (TLS+auth still mandatory, SG still restricted to my-IP).
+- Used the AWS-managed KMS key (free) instead of a customer-managed CMK ($1/month), since granular per-key audit requirements aren't proportional to the needs of this exercise.
 
 ## 3. Monitoring
 
@@ -59,37 +59,37 @@ Ya — Terraform dipisah per module (network, compute, security) dan pakai varia
 | Node | open file descriptors | near ulimit | Metricbeat |
 | Query | search/index latency | baseline + 2x | Metricbeat / slow log |
 
-- Dashboard: Kibana (bundled, no extra infra) sebagai default; CloudWatch dashboard untuk OS-level metric (gratis basic monitoring).
-- Alerting: CloudWatch Alarm → SNS untuk threshold di atas (batasi ke metric kritis: heap%, disk%, cluster status — agar tetap dalam 10 custom metric gratis).
-- Monitoring credential pakai role terbatas `remote_monitoring_collector`, bukan superuser `elastic`.
+- Dashboard: Kibana (bundled, no extra infra) as the default; CloudWatch dashboard for OS-level metrics (free basic monitoring).
+- Alerting: CloudWatch Alarm → SNS for the thresholds above (limited to the most critical metrics: heap%, disk%, cluster status — to stay within the 10 free custom metrics).
+- Monitoring credentials use a restricted `remote_monitoring_collector` role, not the `elastic` superuser.
 
-## 4. Extend ke 3-node cluster (secure)
+## 4. Extending to a secure 3-node cluster
 
-- `discovery.seed_hosts` = 3 private IP node; semua node master-eligible + data (quorum otomatis butuh 2/3 vote, toleran 1 node down).
-- Sebar node di ≥2 AZ berbeda untuk fault tolerance AZ-level.
-- **Transport layer (9300) wajib TLS + mutual-auth** antar node — pakai node certs dari CA yang sama (bukan cuma HTTP layer seperti single-node).
-- Security Group: 9300 inbound hanya dari SG-ES sendiri (self-referencing), tidak pernah publik.
-- Terraform: ubah `aws_instance` jadi `count = 3` / `for_each` per subnet, tiap instance fetch cert unik dari CA yang disimpan di Secrets Manager/Parameter Store.
+- `discovery.seed_hosts` = the 3 nodes' private IPs; all nodes are master-eligible + data nodes (automatic quorum requires 2/3 votes, tolerates 1 node down).
+- Spread nodes across ≥2 different AZs for AZ-level fault tolerance.
+- **Transport layer (9300) must use TLS + mutual auth** between nodes — using node certs from the same CA (not just the HTTP layer like the single-node setup).
+- Security Group: 9300 inbound only from the ES SG itself (self-referencing), never public.
+- Terraform: change `aws_instance` to `count = 3` / `for_each` per subnet, each instance fetching a unique cert from the CA stored in Secrets Manager/Parameter Store.
 
 ## 5. Cost Breakdown (Free Tier Reality Check)
 
-| Komponen | Ideal best-practice | Est. cost/bulan | Keputusan diambil |
+| Component | Ideal best practice | Est. cost/month | Decision made |
 |---|---|---|---|
-| EC2 (3 node) | Private subnet, 3 node HA | ~$15 (2 node bayar) | **1 node** untuk demo, dokumentasikan extension |
-| NAT Gateway | Private subnet akses internet | ~$32 | **Public subnet + SG ketat** (no NAT) |
-| Secrets Manager | Rotasi otomatis | ~$0.5 | **SSM Parameter Store SecureString** (gratis) |
-| KMS CMK | Custom key, audit granular | ~$1 | **AWS-managed key** (gratis) |
-| CloudWatch custom metrics | Full observability semua metric | bisa > free tier | Batasi ke 3-5 metric kritis (dalam 10 gratis) |
-| EBS | gp3 per node | gratis ≤30GB total | Volume kecil (10-15GB/node) |
+| EC2 (3 nodes) | Private subnet, 3-node HA | ~$15 (2 nodes paid) | **1 node** for the demo, extension documented |
+| NAT Gateway | Private subnet internet access | ~$32 | **Public subnet + strict SG** (no NAT) |
+| Secrets Manager | Automatic rotation | ~$0.5 | **SSM Parameter Store SecureString** (free) |
+| KMS CMK | Custom key, granular audit | ~$1 | **AWS-managed key** (free) |
+| CloudWatch custom metrics | Full observability across all metrics | could exceed free tier | Limited to 3-5 critical metrics (within the free 10) |
+| EBS | gp3 per node | free ≤30GB total | Small volumes (10-15GB/node) |
 
-**Total estimasi implementasi actual (1-node, semua opsi hemat): $0/bulan** dalam window free-tier 12 bulan pertama.
+**Total estimated cost of the actual implementation (1-node, all cost-saving options): $0/month** within the first 12-month free-tier window.
 
-## 6. Resources yang dikonsultasikan
+## 6. Resources consulted
 - AWS Free Tier documentation — https://aws.amazon.com/free
 - Elastic Security documentation (X-Pack Security, TLS setup) — https://www.elastic.co/guide/en/elasticsearch/reference/current/secure-cluster.html
 - AWS Systems Manager Session Manager docs — https://docs.aws.amazon.com/systems-manager/
 
-(ASSUMPTION: link di atas placeholder umum, ganti dengan sumber spesifik yang benar-benar dibaca saat pengerjaan.)
+(ASSUMPTION: the links above are generic placeholders — replace with the specific sources actually consulted during the work.)
 
-## 7. Waktu pengerjaan & feedback
-(Isi setelah eksekusi — user diminta melaporkan waktu aktual & feedback jujur soal exercise.)
+## 7. Time spent & feedback
+(Fill in after execution — the candidate is asked to report actual time spent and honest feedback on the exercise.)

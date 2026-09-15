@@ -211,7 +211,7 @@ File ini yang benar-benar menginstall dan mengonfigurasi ElasticSearch, dijalank
 3. `aws_cloudwatch_metric_alarm.es_node_cpu_high` (per node, `for_each`) — alarm CPU > 80% selama 15 menit (3×5menit).
 4. `aws_cloudwatch_metric_alarm.es_node_status_check_failed` (per node) — alarm AWS instance/system status check gagal (deteksi hardware/network failure level EC2).
 5. `aws_cloudwatch_metric_alarm.es_cluster_health_not_green` — alarm berbasis **custom metric** (CloudWatch tidak tahu apa-apa soal health internal ES secara native).
-6. `aws_iam_role_policy.es_cloudwatch_put_metric` — tambah izin `cloudwatch:PutMetricData` ke role ES yang sudah ada, dibatasi hanya untuk namespace `ESPaidTier/Custom` (least privilege, tidak wildcard semua namespace).
+6. `aws_iam_role_policy.es_cloudwatch_put_metric` — tambah izin `cloudwatch:PutMetricData` ke role ES yang sudah ada, dibatasi hanya untuk namespace `EsTest/Custom` (least privilege, tidak wildcard semua namespace).
 
 Semua alarm pakai `treat_missing_data = "breaching"` — kalau metric tidak ada sama sekali (node mati, cron berhenti, dsb), dianggap kondisi BURUK dan alarm tetap trigger. Ini mencegah kegagalan monitoring itu sendiri jadi silent.
 

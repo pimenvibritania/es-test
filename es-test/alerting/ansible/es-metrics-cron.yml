@@ -1,7 +1,7 @@
 ---
 # Deploys a small cron script on every ES node that polls its own
 # _cluster/health and pushes a custom CloudWatch metric (ClusterHealthStatus,
-# namespace ESPaidTier/Custom). This is what the CloudWatch alarm in
+# namespace EsTest/Custom). This is what the CloudWatch alarm in
 # ../terraform/main.tf actually alarms on -- CloudWatch has no native
 # visibility into ES's internal health otherwise.
 
@@ -47,7 +47,7 @@
 
           aws cloudwatch put-metric-data \
             --region {{ aws_region }} \
-            --namespace ESPaidTier/Custom \
+            --namespace EsTest/Custom \
             --metric-name ClusterHealthStatus \
             --value "$VALUE" \
             --unit None

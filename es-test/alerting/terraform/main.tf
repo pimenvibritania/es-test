@@ -94,7 +94,7 @@ resource "aws_cloudwatch_metric_alarm" "es_cluster_health_not_green" {
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "ClusterHealthStatus"
-  namespace           = "ESPaidTier/Custom"
+  namespace           = "EsTest/Custom"
   period              = 60
   statistic           = "Maximum"
   threshold           = 0 # >0 means yellow or red
@@ -119,7 +119,7 @@ resource "aws_iam_role_policy" "es_cloudwatch_put_metric" {
       Resource = "*" # PutMetricData does not support resource-level permissions
       Condition = {
         StringEquals = {
-          "cloudwatch:namespace" = "ESPaidTier/Custom"
+          "cloudwatch:namespace" = "EsTest/Custom"
         }
       }
     }]

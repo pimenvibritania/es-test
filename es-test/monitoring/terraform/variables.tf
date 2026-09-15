@@ -1,6 +1,6 @@
 variable "aws_region" {
   type    = string
-  default = "ap-southeast-3" # Jakarta -- must match the paid-tier ES cluster's region
+  default = "ap-southeast-3" # Jakarta -- must match the es-test ES cluster's region
 }
 
 variable "instance_type" {

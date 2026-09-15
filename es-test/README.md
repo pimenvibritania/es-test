@@ -1,8 +1,8 @@
-# Paid Tier — Secure 3-Node ElasticSearch Cluster (AWS, NOT free)
+# es-test — Secure 3-Node ElasticSearch Cluster (AWS)
 
-Status: **NOT YET applied/tested**. This is the "extend to production-grade" path described in the take-home answers — it intentionally uses paid AWS components (NAT Gateway, customer-managed KMS CMK, Secrets Manager) that the free-tier variant avoids.
+Status: **Deployed and verified** — 3-node ES cluster (green), Kibana, Pritunl VPN, CloudWatch alarms + SNS alerting all live.
 
-## What this adds on top of free-tier
+## What this stack provides
 - **3x EC2** nodes spread across 2 Availability Zones, all master-eligible + data nodes (quorum = 2/3, tolerates 1 node down)
 - **Private subnets** + NAT Gateway (nodes have no public IP; outbound internet via NAT)
 - **Transport-layer TLS (port 9300)** with mutual auth between nodes — required for multi-node security, not needed in single-node
@@ -10,14 +10,14 @@ Status: **NOT YET applied/tested**. This is the "extend to production-grade" pat
 - **AWS Secrets Manager** (vs SSM Parameter Store) for the `elastic` password — supports automatic rotation
 - Security Group for port 9300 restricted to **self-referencing** (only members of the same SG can talk to each other)
 
-## Cost impact vs free-tier (estimates, us-east-1, ASSUMPTION — verify with AWS Pricing Calculator)
+## Cost profile (estimates, ASSUMPTION — verify with AWS Pricing Calculator)
 | Component | Est. cost/month | Why it's here |
 |---|---|---|
-| 2 extra EC2 (t3.micro beyond the 1 free) | ~$15 | 3-node HA quorum |
+| 3x EC2 (t3.small) | ~$45 | 3-node HA quorum |
 | NAT Gateway | ~$32 + data processed | Private subnet egress without public IP |
 | Secrets Manager (1 secret) | ~$0.40 | Automatic rotation support |
 | KMS CMK | ~$1 | Customer-managed key, own audit trail |
-| **Total extra vs free-tier** | **~$48+/month** | |
+| **Total est.** | **~$78+/month** | Currently covered by active AWS promotional credit — see `docs/02_SUPPORTING_INSTRUCTIONS_EN.md` |
 
 ## Usage
 ```bash
@@ -30,7 +30,7 @@ terraform apply -var="allowed_cidr=<your-ip>/32"
 ## Verification
 ```bash
 # from an instance inside the VPC (e.g. via SSM into any of the 3 nodes)
-SECRET=$(aws secretsmanager get-secret-value --secret-id elasticsearch/paid-tier/elastic-password --query SecretString --output text)
+SECRET=$(aws secretsmanager get-secret-value --secret-id elasticsearch/es-test/elastic-password --query SecretString --output text)
 curl -k -u elastic:$SECRET https://<any-node-private-ip>:9200/_cluster/health?pretty
 # expect: "number_of_nodes": 3, "status": "green"
 ```

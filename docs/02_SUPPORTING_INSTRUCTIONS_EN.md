@@ -8,7 +8,7 @@ This document maps the delivered code directly to the requirements in the origin
 
 > Bring up an AWS instance; install ElasticSearch configured to require credentials and provide encrypted communication; demonstrate it is functioning. Bonus: extend to a 3-node cluster. Must use AWS free tier (mention any additional paid services used). Exercise budget: 2.5 hours.
 
-**Scope decision**: this repository's final submission is a **single implementation**, located in `es-test/` (formerly `paid-tier/`, renamed for the final submission). An earlier free-tier-only single-node draft (`_archived_free-tier/`) was scoped out and superseded — the delivered `es-test/` stack is the sole deliverable, covering both the base requirement (secured, credentialed, encrypted single-purpose ES) **and** the bonus (3-node cluster + VPN + monitoring + alerting).
+**Scope**: this repository's final submission is a **single implementation**, located in `es-test/`. It is the sole deliverable, covering both the base requirement (secured, credentialed, encrypted single-purpose ES) **and** the bonus (3-node cluster + VPN + monitoring + alerting).
 
 Because `es-test/` deliberately goes beyond what's strictly free-tier-eligible (see section 8 for the full breakdown), the sections below are explicit about **which specific pieces of the stack are free-tier-eligible and which are paid**, and how the paid pieces are currently funded.
 
@@ -71,7 +71,7 @@ Approximately 2.5 hours were spent on the initial base + bonus (3-node) build wi
 **Implemented in this repository** (`es-test/monitoring/` + `es-test/alerting/` stacks):
 1. **Kibana** — deployed as a dedicated instance, reachable only through the VPN, giving visual access to ES's own monitoring UI / indices / query console.
 2. **AWS CloudWatch native EC2 metrics** — per node: `CPUUtilization` (alarm >80% sustained 15 min) and `StatusCheckFailed` (AWS's own instance/system health check, catches hardware/network-level failures CloudWatch itself detects without any agent).
-3. **Custom application-level metric** — CloudWatch has zero native visibility into ES's *internal* cluster health (green/yellow/red), so a small cron script on every node polls `_cluster/health` locally every minute and pushes a numeric metric (`0=green, 1=yellow, 2=red`) to a custom CloudWatch namespace (`ESPaidTier/Custom`) via `aws cloudwatch put-metric-data`. An alarm fires if this value is ever >0.
+3. **Custom application-level metric** — CloudWatch has zero native visibility into ES's *internal* cluster health (green/yellow/red), so a small cron script on every node polls `_cluster/health` locally every minute and pushes a numeric metric (`0=green, 1=yellow, 2=red`) to a custom CloudWatch namespace (`EsTest/Custom`) via `aws cloudwatch put-metric-data`. An alarm fires if this value is ever >0.
 4. **SNS email alerting** — all the above alarms feed into a single SNS topic subscribed to an email address; `treat_missing_data = "breaching"` on every alarm ensures that if the cron job itself stops running (or an instance goes fully unreachable), that silence is *itself* treated as an alarm condition rather than going unnoticed.
 
 **Additional metrics I would add given more time / a real production deployment:**

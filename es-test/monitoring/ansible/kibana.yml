@@ -1,6 +1,6 @@
 ---
 # Installs and configures Kibana on the monitoring instance, pointed at the
-# paid-tier ES cluster. Access is via SSM Session Manager only (same pattern
+# es-test ES cluster. Access is via SSM Session Manager only (same pattern
 # as ../../ansible/elasticsearch.yml), no SSH keys anywhere.
 
 - name: Provision Kibana monitoring UI

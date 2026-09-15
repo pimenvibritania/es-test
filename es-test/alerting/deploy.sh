@@ -3,7 +3,7 @@
 # remote state for instance IDs + IAM role) + cron-based ES cluster health
 # metric pusher (Ansible, reuses ../ansible inventory pattern).
 #
-# PREREQUISITE: ../../terraform (paid-tier ES cluster) must already be applied.
+# PREREQUISITE: ../../terraform (es-test ES cluster) must already be applied.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,9 +1,9 @@
-# VPN Access Layer — Pritunl (paid-tier variant)
+# VPN Access Layer — Pritunl (es-test variant)
 
-Status: **NOT YET applied/tested**. Adds a Pritunl VPN server (free, open-source, OpenVPN-based) in front of the paid-tier 3-node ElasticSearch cluster in `../../terraform`.
+Status: **Deployed and verified**. Adds a Pritunl VPN server (free, open-source, OpenVPN-based) in front of the es-test 3-node ElasticSearch cluster in `../../terraform`.
 
 ## Prerequisite
-`../../terraform` (the paid-tier 3-node ES cluster) must already be `terraform apply`'d, because this module reads its `vpc_id`, `public_subnet_id`, and `es_security_group_id` directly from its local `terraform.tfstate` via `terraform_remote_state`. All 3 ES nodes share one security group, so a single rule here covers all of them.
+`../../terraform` (the es-test 3-node ES cluster) must already be `terraform apply`'d, because this module reads its `vpc_id`, `public_subnet_id`, and `es_security_group_id` directly from its local `terraform.tfstate` via `terraform_remote_state`. All 3 ES nodes share one security group, so a single rule here covers all of them.
 
 ## What it does
 - Deploys 1 EC2 instance running Pritunl + MongoDB in the cluster's public subnet.
@@ -33,5 +33,5 @@ Browse to `https://<public-ip>/`, log in, change password, create Organization +
 Download from https://client.pritunl.com, import the `.ovpn` profile, connect. Once connected you're on the VPC private network and can reach any of the 3 ES node private IPs on 9200.
 
 ## Cost
-- EC2 t3.micro running Pritunl: this is on top of the paid-tier cluster's existing costs (3 nodes + NAT Gateway etc, see root `INSTRUCTIONS.md`), so it is **not free** in this configuration (~$7-8/month, t3.micro on-demand).
+- EC2 t3.micro running Pritunl: this is on top of the es-test cluster's existing costs (3 nodes + NAT Gateway etc, see root `INSTRUCTIONS.md`), so it is **not free** in this configuration (~$7-8/month, t3.micro on-demand).
 - Elastic IP: free while attached to a running instance.
