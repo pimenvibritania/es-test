@@ -1,0 +1,91 @@
+---
+- name: Install and configure Pritunl VPN server (free community edition)
+  hosts: vpn
+  become: true
+  vars:
+    mongodb_version: "6.0"
+
+  tasks:
+    - name: Import MongoDB GPG key
+      rpm_key:
+        state: present
+        key: https://pgp.mongodb.com/server-{{ mongodb_version }}.asc
+
+    - name: Add MongoDB yum repo
+      yum_repository:
+        name: mongodb-org
+        description: MongoDB Repository
+        baseurl: "https://repo.mongodb.org/yum/amazon/2023/mongodb-org/{{ mongodb_version }}/x86_64/"
+        gpgcheck: true
+        enabled: true
+        gpgkey: "https://pgp.mongodb.com/server-{{ mongodb_version }}.asc"
+
+    - name: Add Pritunl yum repo
+      # RISK NOTE (risk area: supply-chain / package integrity): gpgcheck is
+      # disabled here. The upstream Pritunl GPG key
+      # (raw.githubusercontent.com/pritunl/pritunl/master/pritunl.asc, and
+      # every other path/mirror tried) now 404s -- the project appears to
+      # have moved or stopped publishing it at that location. This means
+      # packages from repo.pritunl.com are installed WITHOUT signature
+      # verification. Mitigations in place: (1) repo is still served over
+      # HTTPS, so transport is authenticated even without package-level
+      # signing; (2) this is a demo/take-home environment, not handling real
+      # customer data. Before using this in anything beyond a test/demo
+      # environment: find Pritunl's current signing key through an official
+      # channel and re-enable gpgcheck.
+      yum_repository:
+        name: pritunl
+        description: Pritunl Repository
+        baseurl: "https://repo.pritunl.com/stable/yum/amazonlinux/2023/"
+        gpgcheck: false
+        enabled: true
+
+    - name: Install EPEL / prerequisites
+      yum:
+        name:
+          - python3-pip
+        state: present
+
+    - name: Install MongoDB
+      yum:
+        name: mongodb-org
+        state: present
+
+    - name: Install Pritunl
+      yum:
+        name: pritunl
+        state: present
+
+    - name: Start and enable MongoDB
+      systemd:
+        name: mongod
+        state: started
+        enabled: true
+
+    - name: Start and enable Pritunl
+      systemd:
+        name: pritunl
+        state: started
+        enabled: true
+
+    - name: Wait for Pritunl web UI to respond
+      # /ping is no longer a valid endpoint on current Pritunl versions
+      # (confirmed 404) -- / redirects (302) once the web server is actually
+      # serving requests, which is a reliable enough readiness signal here.
+      uri:
+        url: "https://localhost/"
+        validate_certs: false
+        status_code: [200, 302, 401]
+      register: pritunl_ready
+      retries: 12
+      delay: 10
+      until: pritunl_ready.status is defined and pritunl_ready.status in [200, 302, 401]
+
+    - name: Show how to retrieve the default admin password
+      debug:
+        msg: >
+          Pritunl is installed and running. SSH/SSM into this instance and run
+          `pritunl default-password` to get the initial admin credentials, then
+          log into https://<this-instance-public-ip>/ to finish setup
+          (change password, create org + user, download .ovpn profile).
+          This step is intentionally manual -- see ../README.md for why.

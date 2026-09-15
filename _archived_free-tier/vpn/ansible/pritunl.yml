@@ -1,0 +1,77 @@
+---
+- name: Install and configure Pritunl VPN server (free community edition)
+  hosts: vpn
+  become: true
+  vars:
+    mongodb_version: "6.0"
+
+  tasks:
+    - name: Import MongoDB GPG key
+      rpm_key:
+        state: present
+        key: https://pgp.mongodb.com/server-{{ mongodb_version }}.asc
+
+    - name: Add MongoDB yum repo
+      yum_repository:
+        name: mongodb-org
+        description: MongoDB Repository
+        baseurl: "https://repo.mongodb.org/yum/amazon/2023/mongodb-org/{{ mongodb_version }}/x86_64/"
+        gpgcheck: true
+        enabled: true
+        gpgkey: "https://pgp.mongodb.com/server-{{ mongodb_version }}.asc"
+
+    - name: Add Pritunl yum repo
+      yum_repository:
+        name: pritunl
+        description: Pritunl Repository
+        baseurl: "https://repo.pritunl.com/stable/yum/amazonlinux/2023/"
+        gpgcheck: true
+        enabled: true
+        gpgkey: "https://raw.githubusercontent.com/pritunl/pritunl/master/pritunl.asc"
+
+    - name: Install EPEL / prerequisites
+      yum:
+        name:
+          - python3-pip
+        state: present
+
+    - name: Install MongoDB
+      yum:
+        name: mongodb-org
+        state: present
+
+    - name: Install Pritunl
+      yum:
+        name: pritunl
+        state: present
+
+    - name: Start and enable MongoDB
+      systemd:
+        name: mongod
+        state: started
+        enabled: true
+
+    - name: Start and enable Pritunl
+      systemd:
+        name: pritunl
+        state: started
+        enabled: true
+
+    - name: Wait for Pritunl web UI to respond
+      uri:
+        url: "https://localhost/ping"
+        validate_certs: false
+        status_code: [200, 401]
+      register: pritunl_ready
+      retries: 12
+      delay: 10
+      until: pritunl_ready.status is defined
+
+    - name: Show how to retrieve the default admin password
+      debug:
+        msg: >
+          Pritunl is installed and running. SSH/SSM into this instance and run
+          `pritunl default-password` to get the initial admin credentials, then
+          log into https://<this-instance-public-ip>/ to finish setup
+          (change password, create org + user, download .ovpn profile).
+          This step is intentionally manual -- see ../README.md for why.

@@ -1,0 +1,387 @@
+---
+# Provisions a 3-node ElasticSearch cluster onto already-created EC2 instances
+# (see ../terraform). Access is via SSM Session Manager only (no SSH keys),
+# same pattern as the VPN role in ../vpn/ansible/pritunl.yml.
+#
+# Fixes two bugs found in the old Terraform user_data bootstrap approach:
+#   1. vm.max_map_count was never raised -- ES's bootstrap checks fail hard
+#      without it (default 65530 is too low once xpack.security is enabled).
+#   2. The discovery-file unicast_hosts.txt was never actually populated with
+#      peer IPs (each node only knew its own IP at boot time) -- nodes could
+#      never see each other and form a quorum. Ansible knows every host's
+#      private IP from the inventory up front, so it can write the *correct*
+#      peer list to every node in one pass.
+
+- name: Provision ElasticSearch 3-node cluster
+  hosts: es_nodes
+  become: true
+  vars:
+    cluster_name: es-test-cluster
+    aws_region: "{{ es_aws_region }}"          # from inventory/group_vars
+    secret_arn: "{{ es_secret_arn }}"           # elastic user password (Secrets Manager)
+    ca_bundle_arn: "{{ es_ca_bundle_arn }}"     # shared CA cert+key (Secrets Manager)
+    p12_pass: "es-transport-p12"                # local-only PKCS12 store password (not a secret exposed externally, just needs to be non-empty -- Java's PKCS12 impl has known issues with a truly empty password)
+    kibana_system_secret_arn: "{{ kb_system_secret_arn | default('') }}"  # kibana_system user password (Secrets Manager); empty = skip
+
+  tasks:
+    - name: Raise vm.max_map_count (required by ES bootstrap checks)
+      sysctl:
+        name: vm.max_map_count
+        value: "262144"
+        state: present
+        reload: true
+
+    - name: Add Elasticsearch yum repo
+      yum_repository:
+        name: elasticsearch
+        description: Elasticsearch repository
+        baseurl: https://artifacts.elastic.co/packages/8.x/yum
+        gpgcheck: true
+        gpgkey: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        enabled: true
+
+    - name: Install ElasticSearch + jq
+      yum:
+        name:
+          - elasticsearch
+          - jq
+        state: present
+
+    - name: Fetch shared CA bundle from Secrets Manager
+      command: >
+        aws secretsmanager get-secret-value --secret-id {{ ca_bundle_arn }}
+        --region {{ aws_region }} --query SecretString --output text
+      register: ca_json
+      changed_when: false
+      no_log: true
+
+    - name: Ensure certs directory exists
+      file:
+        path: /etc/elasticsearch/certs
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check if node cert already has correct SAN entries (idempotency check)
+      command: >
+        openssl pkcs12 -in /etc/elasticsearch/certs/node.p12 -passin pass:{{ p12_pass }} -nokeys -clcerts 2>/dev/null | openssl x509 -noout -text 2>/dev/null | grep -q "DNS:localhost"
+      register: node_cert_has_san
+      changed_when: false
+      failed_when: false
+
+    - name: Remove any stale/corrupt cert material from previous failed runs
+      # Java's PKCS12 keystore implementation has known quirks with a truly
+      # empty ("") password vs a real one, which caused
+      # "keystore password was incorrect" / BadPaddingException at ES
+      # startup even though the same empty password was used consistently.
+      # ALSO: node certs generated without --dns/--ip have no SAN entries,
+      # which breaks hostname verification for localhost-based tools like
+      # elasticsearch-reset-password. Only wipe+regenerate when the existing
+      # cert doesn't already have the right SAN -- once fixed, this is a
+      # no-op on subsequent runs so we don't force an ES restart every time.
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/elasticsearch/certs/ca.p12
+        - /etc/elasticsearch/certs/node.p12
+      when: node_cert_has_san.rc != 0
+
+    - name: Write CA cert to disk (temp)
+      copy:
+        content: "{{ (ca_json.stdout | from_json).ca_cert }}"
+        dest: /tmp/ca.crt
+        mode: "0600"
+      no_log: true
+
+    - name: Write CA key to disk (temp)
+      copy:
+        content: "{{ (ca_json.stdout | from_json).ca_key }}"
+        dest: /tmp/ca.key
+        mode: "0600"
+      no_log: true
+
+    - name: Build CA p12 keystore
+      command: >
+        openssl pkcs12 -export -in /tmp/ca.crt -inkey /tmp/ca.key
+        -name ca -out /etc/elasticsearch/certs/ca.p12 -passout pass:{{ p12_pass }}
+      args:
+        creates: /etc/elasticsearch/certs/ca.p12
+
+    - name: Issue this node's cert signed by the shared CA
+      command: >
+        /usr/share/elasticsearch/bin/elasticsearch-certutil cert
+        --ca /etc/elasticsearch/certs/ca.p12 --ca-pass {{ p12_pass }}
+        --name {{ inventory_hostname }}
+        --dns localhost,{{ inventory_hostname }}
+        --ip 127.0.0.1,{{ private_ip }}
+        --out /etc/elasticsearch/certs/node.p12 --pass {{ p12_pass }} --silent
+      args:
+        creates: /etc/elasticsearch/certs/node.p12
+
+    - name: Fix ownership/perms on cert material
+      file:
+        path: "{{ item }}"
+        owner: elasticsearch
+        group: elasticsearch
+        mode: "0660"
+      loop:
+        - /etc/elasticsearch/certs/ca.p12
+        - /etc/elasticsearch/certs/node.p12
+
+    - name: Shred temp CA files
+      command: shred -u /tmp/ca.crt /tmp/ca.key
+      changed_when: false
+
+    - name: Temporarily chown keystore to root so the keystore CLI can write to it
+      file:
+        path: /etc/elasticsearch/elasticsearch.keystore
+        owner: root
+        group: root
+
+    - name: Store the p12 keystore password in the ES keystore (secure_password)
+      # elasticsearch.yml itself must never contain the p12 password in
+      # plaintext -- ES's own encrypted keystore is where these
+      # secure_password settings belong. /etc/elasticsearch is root:elasticsearch
+      # mode 750 (group has no write), so `su elasticsearch` can't create the
+      # required temp file there, and running as root against an
+      # elasticsearch-owned keystore refuses ("would change owner"). Fix:
+      # run as root, which is fine on a fresh keystore (created at install
+      # time, already root-writable) -- then fix ownership back afterwards.
+      command: >
+        /usr/share/elasticsearch/bin/elasticsearch-keystore add -x -f {{ item }}
+      args:
+        stdin: "{{ p12_pass }}"
+      loop:
+        - xpack.security.http.ssl.keystore.secure_password
+        - xpack.security.transport.ssl.keystore.secure_password
+        - xpack.security.transport.ssl.truststore.secure_password
+      no_log: true
+
+    - name: Fix keystore ownership back to elasticsearch after root-run keystore add
+      file:
+        path: /etc/elasticsearch/elasticsearch.keystore
+        owner: elasticsearch
+        group: elasticsearch
+        mode: "0660"
+
+    - name: Populate discovery-file with EVERY peer's private IP (the actual fix)
+      # ES's file-based discovery expects the seed hosts list at
+      # /etc/elasticsearch/unicast_hosts.txt directly (NOT in a
+      # discovery-file/ subdirectory -- that was a bug in the original
+      # user_data script that we're not repeating here).
+      lineinfile:
+        path: /etc/elasticsearch/unicast_hosts.txt
+        create: true
+        owner: elasticsearch
+        group: elasticsearch
+        line: "{{ hostvars[item].private_ip }}:9300"
+        mode: "0644"
+      loop: "{{ groups['es_nodes'] }}"
+
+    - name: Ensure ES logs directory/symlink exists (RPM scriptlet sometimes
+             skips this depending on install context)
+      file:
+        src: /var/log/elasticsearch
+        dest: /usr/share/elasticsearch/logs
+        state: link
+        owner: elasticsearch
+        group: elasticsearch
+        force: true
+
+    - name: Ensure ES data directory exists with correct ownership (same
+             RPM-scriptlet-skip issue as the logs symlink above)
+      file:
+        path: /usr/share/elasticsearch/data
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: "0750"
+
+    - name: Fix ownership of the whole ES install dir (belt-and-suspenders --
+             RPM scriptlet appears not to run fully in this environment)
+      file:
+        path: /usr/share/elasticsearch
+        owner: elasticsearch
+        group: elasticsearch
+        recurse: true
+
+    - name: Check whether elasticsearch.yml already has our managed block
+      command: grep -q "# BEGIN ANSIBLE MANAGED BLOCK" /etc/elasticsearch/elasticsearch.yml
+      register: es_yml_already_managed
+      changed_when: false
+      failed_when: false
+
+    - name: Remove ES's auto-generated elasticsearch.yml entirely, start clean
+      # The elasticsearch RPM auto-appends single-node auto-configuration to
+      # elasticsearch.yml on first install (cluster.initial_master_nodes,
+      # nested xpack.security.enrollment blocks, etc). Surgical line removal
+      # is fragile here because some of those are multi-line YAML block
+      # mappings (removing one line breaks the indentation/structure of
+      # neighboring blocks -> YAML parse error). Simplest reliable fix:
+      # replace the whole file with our own minimal, fully-managed config.
+      # Only do this once -- guarded so re-running the playbook doesn't force
+      # an unnecessary ES restart every time via a spurious "changed".
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        content: ""
+        force: true
+        backup: true
+      when: es_yml_already_managed.rc != 0
+
+    - name: Configure elasticsearch.yml
+      blockinfile:
+        path: /etc/elasticsearch/elasticsearch.yml
+        marker: "# {mark} ANSIBLE MANAGED BLOCK -- cluster identity/security/discovery"
+        block: |
+          cluster.name: {{ cluster_name }}
+          node.name: {{ inventory_hostname }}
+          node.roles: [ master, data ]
+          network.host: 0.0.0.0
+          network.publish_host: {{ private_ip }}
+
+          discovery.seed_providers: file
+          cluster.initial_master_nodes: [{{ groups['es_nodes'] | join(', ') }}]
+
+          xpack.security.enabled: true
+          xpack.security.http.ssl.enabled: true
+          xpack.security.http.ssl.keystore.path: certs/node.p12
+          xpack.security.transport.ssl.enabled: true
+          xpack.security.transport.ssl.verification_mode: certificate
+          xpack.security.transport.ssl.keystore.path: certs/node.p12
+          xpack.security.transport.ssl.truststore.path: certs/node.p12
+      register: es_config_result
+
+    - name: Enable + (re)start elasticsearch
+      # Only force a restart when config/certs actually changed this run --
+      # a plain `started` would otherwise be a silent no-op on subsequent
+      # idempotent runs where nothing needs to change.
+      systemd:
+        name: elasticsearch
+        state: "{{ 'restarted' if (es_config_result.changed or node_cert_has_san.rc != 0) else 'started' }}"
+        enabled: true
+        daemon_reload: true
+
+    - name: Wait for node's local HTTPS API to respond
+      uri:
+        url: https://localhost:9200
+        validate_certs: false
+        status_code: [200, 401]
+      register: es_ready
+      retries: 24
+      delay: 5
+      until: es_ready.status is defined
+
+    - name: Fetch elastic user password from Secrets Manager (any single node fetches it via its own IAM role)
+      command: >
+        aws secretsmanager get-secret-value --secret-id {{ secret_arn }}
+        --region {{ aws_region }} --query SecretString --output text
+      register: elastic_pw
+      changed_when: false
+      no_log: true
+      run_once: true
+      become: false
+
+    - name: Set elastic superuser password (idempotent, run once from any single node)
+      # BUG FOUND: injecting the password directly into the Jinja-rendered
+      # shell string is unsafe -- if the random password contains a `$`
+      # followed by a letter/digit (e.g. "...$a4..."), bash inside the
+      # `shell:` module interprets that as variable expansion and silently
+      # drops/mangles it. elasticsearch-reset-password still reports
+      # "successfully reset" (rc=0) because *some* string got submitted --
+      # it's just not the actual secret. Fix: pass the password via an
+      # `environment:` var and reference it as "$ELASTIC_PW" (single-quoted
+      # in the printf format string) so bash does a real, safe variable
+      # substitution instead of Jinja splatting a raw literal into the script.
+      shell: |
+        printf 'y\n%s\n%s\n' "$ELASTIC_PW" "$ELASTIC_PW" | \
+          /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic -i --url https://localhost:9200
+      environment:
+        ELASTIC_PW: "{{ elastic_pw.stdout }}"
+      no_log: true
+      run_once: true
+
+    - name: Report cluster health (sanity check, no secrets printed)
+      uri:
+        url: "https://localhost:9200/_cluster/health"
+        validate_certs: false
+        user: elastic
+        password: "{{ elastic_pw.stdout }}"
+        force_basic_auth: true
+      register: health
+      run_once: true
+      no_log: true
+
+    - name: Show cluster health status only
+      debug:
+        msg: "Cluster status: {{ health.json.status }}, nodes: {{ health.json.number_of_nodes }}"
+      run_once: true
+
+    - name: Fetch kibana_system password from Secrets Manager (if provided)
+      command: >
+        aws secretsmanager get-secret-value --secret-id {{ kibana_system_secret_arn }}
+        --region {{ aws_region }} --query SecretString --output text
+      register: kibana_system_pw
+      changed_when: false
+      no_log: true
+      run_once: true
+      when: kibana_system_secret_arn | length > 0
+
+    - name: Set kibana_system user password (so Kibana can auth without using the elastic superuser)
+      # Kibana >=8.x hard-refuses elasticsearch.username: "elastic" ("This is
+      # a superuser account that cannot write to system indices") -- the
+      # built-in kibana_system role-restricted user is mandatory, not
+      # optional, contrary to what an earlier version of this playbook
+      # assumed.
+      # Same shell-injection bug as the elastic-superuser task above: this
+      # is the actual root cause of the Kibana 503 outage. The generated
+      # kibana_system password happened to contain "$a4" -- bash silently
+      # ate/mangled it when Jinja splatted the raw literal into the shell
+      # script, so the password ES ended up with did not match what was
+      # stored in Secrets Manager (and what Kibana was configured to send).
+      # elasticsearch-reset-password still reported success because it did
+      # submit *a* password successfully -- just the wrong (mangled) one.
+      shell: |
+        printf 'y\n%s\n%s\n' "$KIBANA_SYSTEM_PW" "$KIBANA_SYSTEM_PW" | \
+          /usr/share/elasticsearch/bin/elasticsearch-reset-password -u kibana_system -i --url https://localhost:9200
+      environment:
+        KIBANA_SYSTEM_PW: "{{ kibana_system_pw.stdout }}"
+      no_log: true
+      run_once: true
+      when: kibana_system_secret_arn | length > 0
+
+    - name: Give the security index a moment to propagate the new kibana_system password
+      # First real-world run of the check below caught a genuine flake here:
+      # elasticsearch-reset-password returns rc=0 immediately, but the
+      # security index update isn't always visible to a local auth check
+      # for a few extra seconds. Give it a head start before the retry loop.
+      pause:
+        seconds: 8
+      run_once: true
+      when: kibana_system_secret_arn | length > 0
+
+    - name: Verify kibana_system password actually works (fail loud instead of silently continuing)
+      # Bug found during a destroy/recreate cycle: elasticsearch-reset-password
+      # can report success (rc=0) while the password it applied doesn't
+      # actually authenticate afterwards (observed once with no clear repro
+      # steps -- possibly a transient cluster-state propagation delay right
+      # after reset). Previously nothing checked this, so the ES stage
+      # reported "changed"/success while Kibana was later stuck at HTTP 503
+      # forever because kibana_system auth was silently broken. This task
+      # makes that failure surface immediately, here, instead of being
+      # discovered later by manually poking Kibana after the fact.
+      uri:
+        url: "https://localhost:9200/_cluster/health"
+        validate_certs: false
+        user: kibana_system
+        password: "{{ kibana_system_pw.stdout }}"
+        force_basic_auth: true
+        status_code: 200
+      register: kibana_system_auth_check
+      retries: 10
+      delay: 5
+      until: kibana_system_auth_check.status is defined and kibana_system_auth_check.status == 200
+      run_once: true
+      no_log: true
+      when: kibana_system_secret_arn | length > 0

@@ -1,0 +1,15 @@
+# Terraform
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfstate.backup
+.terraform.lock.hcl
+crash.log
+crash.*.log
+
+# Ansible generated inventories (contain instance IDs/secret ARNs, regenerated per deploy)
+**/inventory.ini
+
+# Local/OS
+.DS_Store
+*.swp

@@ -1,0 +1,121 @@
+---
+# Installs and configures Kibana on the monitoring instance, pointed at the
+# paid-tier ES cluster. Access is via SSM Session Manager only (same pattern
+# as ../../ansible/elasticsearch.yml), no SSH keys anywhere.
+
+- name: Provision Kibana monitoring UI
+  hosts: kibana
+  become: true
+  vars:
+    aws_region: "{{ kb_aws_region }}"
+    es_secret_arn: "{{ kb_kibana_system_secret_arn }}"  # kibana_system service-account password (Secrets Manager) -- Kibana 8.x hard-refuses the "elastic" superuser
+    es_node_ips: "{{ kb_es_node_ips }}"          # comma-separated private IPs, e.g. "10.1.1.10,10.1.2.20,10.1.1.30"
+    ca_bundle_arn: "{{ kb_ca_bundle_arn }}"
+
+  tasks:
+    - name: Add Elasticsearch/Kibana yum repo (same artifacts.elastic.co repo serves both)
+      yum_repository:
+        name: elasticsearch
+        description: Elastic repository
+        baseurl: https://artifacts.elastic.co/packages/8.x/yum
+        gpgcheck: true
+        gpgkey: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        enabled: true
+
+    - name: Install Kibana + jq
+      yum:
+        name:
+          - kibana
+          - jq
+        state: present
+
+    - name: Fetch shared CA bundle from Secrets Manager (to trust ES's self-signed cert)
+      command: >
+        aws secretsmanager get-secret-value --secret-id {{ ca_bundle_arn }}
+        --region {{ aws_region }} --query SecretString --output text
+      register: ca_json
+      changed_when: false
+      no_log: true
+
+    - name: Ensure Kibana certs directory exists
+      file:
+        path: /etc/kibana/certs
+        state: directory
+        owner: root
+        group: kibana
+        mode: "0750"
+
+    - name: Write CA cert for Kibana to trust ES's HTTP layer
+      copy:
+        content: "{{ (ca_json.stdout | from_json).ca_cert }}"
+        dest: /etc/kibana/certs/es_ca.crt
+        owner: root
+        group: kibana
+        mode: "0640"
+      no_log: true
+
+    - name: Fetch kibana_system password from Secrets Manager
+      command: >
+        aws secretsmanager get-secret-value --secret-id {{ es_secret_arn }}
+        --region {{ aws_region }} --query SecretString --output text
+      register: elastic_pw
+      changed_when: false
+      no_log: true
+
+    - name: Check whether kibana.yml already has our managed block (idempotency)
+      command: grep -q "# BEGIN ANSIBLE MANAGED BLOCK" /etc/kibana/kibana.yml
+      register: kibana_yml_already_managed
+      changed_when: false
+      failed_when: false
+
+    - name: Reset kibana.yml to a clean slate on first run only
+      copy:
+        dest: /etc/kibana/kibana.yml
+        content: ""
+        force: true
+        backup: true
+      when: kibana_yml_already_managed.rc != 0
+
+    - name: Configure kibana.yml
+      blockinfile:
+        path: /etc/kibana/kibana.yml
+        marker: "# {mark} ANSIBLE MANAGED BLOCK -- ES connection/network"
+        block: |
+          server.host: "0.0.0.0"
+          server.port: 5601
+          server.publicBaseUrl: "http://{{ ansible_default_ipv4.address | default(private_ip) }}:5601"
+
+          elasticsearch.hosts: {{ es_node_ips.split(',') | map('trim') | map('regex_replace', '^', 'https://') | map('regex_replace', '$', ':9200') | list | to_json }}
+          elasticsearch.username: "kibana_system"
+          elasticsearch.password: {{ elastic_pw.stdout | to_json }}
+          elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/es_ca.crt"]
+          elasticsearch.ssl.verificationMode: certificate
+      register: kibana_config_result
+      no_log: true
+
+    - name: Enable + (re)start kibana
+      systemd:
+        name: kibana
+        state: "{{ 'restarted' if kibana_config_result.changed else 'started' }}"
+        enabled: true
+        daemon_reload: true
+
+    - name: Wait for Kibana HTTP API to become fully healthy
+      # Previously accepted status_code [200, 503] here, treating 503
+      # ("still initializing") as a pass. That masked a real bug: if Kibana
+      # got stuck permanently at 503 (e.g. broken kibana_system auth), this
+      # task -- and the whole playbook -- reported success anyway, and the
+      # only way anyone found out Kibana was actually down was by manually
+      # curling it well after "deploy finished". Now we retry until we see
+      # a real 200, and fail the playbook loudly if that never happens.
+      uri:
+        url: "http://localhost:5601/api/status"
+        status_code: 200
+      register: kb_ready
+      retries: 30
+      delay: 5
+      until: kb_ready.status is defined and kb_ready.status == 200
+
+    - name: Report Kibana readiness
+      debug:
+        msg: "Kibana is up: HTTP {{ kb_ready.status }}"

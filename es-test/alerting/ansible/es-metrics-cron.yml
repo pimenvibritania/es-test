@@ -1,0 +1,76 @@
+---
+# Deploys a small cron script on every ES node that polls its own
+# _cluster/health and pushes a custom CloudWatch metric (ClusterHealthStatus,
+# namespace ESPaidTier/Custom). This is what the CloudWatch alarm in
+# ../terraform/main.tf actually alarms on -- CloudWatch has no native
+# visibility into ES's internal health otherwise.
+
+- name: Deploy ES cluster health -> CloudWatch metric cron
+  hosts: es_nodes
+  become: true
+  vars:
+    aws_region: "{{ es_aws_region }}"
+    secret_arn: "{{ es_secret_arn }}"
+
+  tasks:
+    - name: Fetch elastic user password (needed to query _cluster/health)
+      command: >
+        aws secretsmanager get-secret-value --secret-id {{ secret_arn }}
+        --region {{ aws_region }} --query SecretString --output text
+      register: elastic_pw
+      changed_when: false
+      no_log: true
+
+    - name: Write cluster-health-to-cloudwatch script
+      copy:
+        dest: /usr/local/bin/es-health-metric.sh
+        mode: "0700"
+        content: |
+          #!/bin/bash
+          # Polls this node's local ES HTTPS API for cluster health and pushes
+          # a numeric metric to CloudWatch: 0=green, 1=yellow, 2=red.
+          # Run via cron every minute (see the cron job below) -- if this
+          # stops running/reporting, the CloudWatch alarm's
+          # treat_missing_data=breaching will fire on its own after a couple
+          # of missed periods, so a dead node doesn't go silently unmonitored.
+          set -euo pipefail
+
+          STATUS=$(curl -sk -u "elastic:{{ elastic_pw.stdout }}" https://localhost:9200/_cluster/health \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "unknown")
+
+          case "$STATUS" in
+            green)  VALUE=0 ;;
+            yellow) VALUE=1 ;;
+            red)    VALUE=2 ;;
+            *)      VALUE=2 ;;  # unknown/unreachable -- treat as worst case, not silence
+          esac
+
+          aws cloudwatch put-metric-data \
+            --region {{ aws_region }} \
+            --namespace ESPaidTier/Custom \
+            --metric-name ClusterHealthStatus \
+            --value "$VALUE" \
+            --unit None
+      no_log: true
+
+    - name: Install cronie (crontab not present on this minimal AMI build)
+      yum:
+        name: cronie
+        state: present
+
+    - name: Enable + start crond
+      systemd:
+        name: crond
+        state: started
+        enabled: true
+
+    - name: Install cron job (every minute)
+      cron:
+        name: "ES cluster health -> CloudWatch metric"
+        minute: "*/1"
+        job: "/usr/local/bin/es-health-metric.sh >> /var/log/es-health-metric.log 2>&1"
+        user: root
+
+    - name: Run once now to verify it works end-to-end
+      command: /usr/local/bin/es-health-metric.sh
+      changed_when: false
