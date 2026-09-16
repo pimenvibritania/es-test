@@ -205,6 +205,17 @@ File ini yang benar-benar menginstall dan mengonfigurasi ElasticSearch, dijalank
    ```
    Versi lama task ini menerima `[200, 503]` sebagai "sukses" — niatnya toleransi Kibana yang masih initializing. Efek sampingnya: kalau Kibana STUCK permanen di 503 (misal karena auth `kibana_system` rusak), playbook tetap lapor sukses, dan baru diketahui error belakangan saat manual curl. Fix: hanya terima 200, gagal loud kalau tidak pernah tercapai dalam 30×5=150 detik.
 
+### Ansible (`monitoring/ansible/kibana-dashboards.yml`) — provisioning dashboard & visualisasi
+Kibana kosong di first-boot itu normal (tidak ada Filebeat/Logstash/Metricbeat di scope proyek ini, jadi tidak ada data yang otomatis masuk ES). Playbook ini mengisinya secara otomatis, tanpa langkah UI manual apapun:
+1. Fetch password `elastic` (BUKAN `kibana_system` — endpoint ini adalah Kibana's own HTTP API/login layer, bukan koneksi Kibana→ES, jadi butuh superuser).
+2. Copy bundle statis `files/kibana-saved-objects.ndjson` (checked-in di repo, isinya cuma definisi index-pattern/visualization/dashboard, tanpa secret apapun — aman di-commit) ke host Kibana.
+3. `POST /api/saved_objects/_import?overwrite=true` (multipart, header `kbn-xsrf: true`) — import 1 index pattern (`es-test-metrics-*`) + 5 visualization (cluster health, CPU/heap/disk per node, doc count, jumlah node) + 1 dashboard yang menggabungkan semuanya. `overwrite=true` bikin playbook idempotent — bisa dijalankan berkali-kali tanpa duplikat objek.
+4. Set dashboard ini sebagai default landing page Kibana (`POST /api/kibana/settings/defaultRoute`) — begitu login, user langsung lihat dashboard terisi, bukan halaman kosong.
+
+Sumber data yang divisualisasikan: index `es-test-metrics-*`, yang diisi oleh cron di `alerting/ansible/es-metrics-cron.yml` (lihat STAGE 4) — bukan Filebeat/Metricbeat terpisah, cukup extend cron yang sudah ada untuk juga menulis ke ES selain CloudWatch.
+
+**Urutan penting**: jalankan playbook ini SETELAH `kibana.yml` (Kibana harus sudah up) DAN setelah `es-metrics-cron.yml` sudah tick minimal sekali di node ES (supaya index `es-test-metrics-*` sudah ada isinya) — kalau dashboard di-import sebelum ada data, panel akan tampil "no data" sampai tick cron berikutnya (1 menit kemudian), bukan error.
+
 ---
 
 ## STAGE 4 — Alerting (`es-test/alerting/`)
@@ -221,10 +232,11 @@ Semua alarm pakai `treat_missing_data = "breaching"` — kalau metric tidak ada 
 
 ### Ansible (`alerting/ansible/es-metrics-cron.yml`)
 1. Fetch password `elastic`.
-2. Tulis script `/usr/local/bin/es-health-metric.sh`: curl `_cluster/health` lokal → mapping status ke angka (`green=0, yellow=1, red=2, unknown=2`) → `aws cloudwatch put-metric-data`.
-3. Install `cronie` (paket cron tidak ada default di AMI minimal ini).
-4. Jalankan setiap 1 menit via cron.
-5. Jalankan sekali langsung setelah install untuk verifikasi end-to-end (bukan hanya percaya cron akan jalan nanti).
+2. Tulis script `/usr/local/bin/es-health-metric.sh`: curl `_cluster/health` lokal → mapping status ke angka (`green=0, yellow=1, red=2, unknown=2`) → `aws cloudwatch put-metric-data` DAN index dokumen (status, cpu/heap/disk %, doc count) ke `es-test-metrics-<tanggal>` di ES lokal — jadi 1 cron, 2 tujuan (CloudWatch untuk alarm, index ES untuk divisualisasikan di Kibana).
+3. Buat index template `es-test-metrics` (field mapping eksplisit: `status_code` keyword, angka-angka sebagai `float`, dst.) SEBELUM cron pertama jalan, supaya Kibana punya field type yang benar untuk visualization (bukan auto-detect yang kadang salah tebak string vs number).
+4. Install `cronie` (paket cron tidak ada default di AMI minimal ini).
+5. Jalankan setiap 1 menit via cron.
+6. Jalankan sekali langsung setelah install untuk verifikasi end-to-end (bukan hanya percaya cron akan jalan nanti) — ini juga yang membuat index `es-test-metrics-*` sudah ada isinya sebelum `monitoring/ansible/kibana-dashboards.yml` (STAGE 3) di-jalankan.
 
 ---
 
@@ -333,5 +345,5 @@ http://<ip-privat-kibana>:5601
 ```
 Login dengan user `elastic` + password yang sama (Kibana sendiri connect ke ES via service-account `kibana_system`, tapi login UI pakai `elastic`).
 
-Buka browser (harus dalam koneksi VPN aktif) → `http://<ip-privat-kibana>:5601` → login. Semua traffic ini murni internal VPC, zero exposure publik.
+Buka browser (harus dalam koneksi VPN aktif) → `http://<ip-privat-kibana>:5601` → login → langsung diarahkan ke dashboard **"ES Test Cluster Overview"** (default landing page, hasil provisioning `monitoring/ansible/kibana-dashboards.yml`) — bukan halaman kosong. Dashboard ini berisi 5 panel: cluster health status, CPU/heap/disk usage per node, jumlah dokumen, dan jumlah node — semua bersumber dari index `es-test-metrics-*` yang diisi tiap 1 menit oleh cron `es-metrics-cron.yml`. Tidak ada langkah "Add sample data" atau setup index pattern manual apapun — sepenuhnya sudah tersedia begitu VPN connect + login. Semua traffic ini murni internal VPC, zero exposure publik.
 
