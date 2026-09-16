@@ -42,6 +42,7 @@ instance_id = kb["instance_id"]["value"]
 private_ip = kb["private_ip"]["value"]
 es_ips = ",".join(es["node_private_ips"]["value"].values())
 kibana_system_secret_arn = es["kibana_system_secret_arn"]["value"]
+elastic_secret_arn = es["elastic_secret_arn"]["value"]
 ca_arn = es["ca_bundle_secret_arn"]["value"]
 region = "ap-southeast-3"
 bucket = es["ansible_transfer_bucket"]["value"]
@@ -58,6 +59,7 @@ lines = [
     "ansible_python_interpreter=/usr/bin/python3",
     f"kb_aws_region={region}",
     f"kb_kibana_system_secret_arn={kibana_system_secret_arn}",
+    f"kb_elastic_secret_arn={elastic_secret_arn}",  # elastic superuser -- needed by kibana-dashboards.yml to call Kibana's own API
     f"kb_ca_bundle_arn={ca_arn}",
     f"kb_es_node_ips={es_ips}",
     "",
@@ -67,7 +69,7 @@ with open(out_path, "w") as f:
 print(f"Wrote Kibana inventory to {out_path}")
 PYEOF
 
-echo "== 3/3: ansible-playbook (Kibana install/config) =="
+echo "== 3/4: ansible-playbook (Kibana install/config) =="
 cd "$ANSIBLE_DIR"
 INSTANCE_ID=$(echo "$KB_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['instance_id']['value'])")
 echo "Waiting for Kibana instance to register with SSM..."
@@ -88,6 +90,23 @@ done
 # race window above.
 for attempt in 1 2 3; do
   if ansible-playbook -i inventory.ini kibana.yml; then
+    break
+  fi
+  echo "Ansible run failed (attempt $attempt/3), retrying after SSM warm-up delay..."
+  sleep 15
+  if [ "$attempt" = "3" ]; then
+    echo "Ansible playbook failed after 3 attempts" >&2
+    exit 1
+  fi
+done
+
+echo "== 4/4: provisioning Kibana dashboard + visualizations =="
+# NOTE: run ../../alerting/deploy.sh (or ansible-playbook es-metrics-cron.yml)
+# at least once BEFORE this step so es-test-metrics-* already has data --
+# otherwise the dashboard imports fine but shows empty panels until the next
+# cron tick on the ES nodes.
+for attempt in 1 2 3; do
+  if ansible-playbook -i inventory.ini kibana-dashboards.yml; then
     break
   fi
   echo "Ansible run failed (attempt $attempt/3), retrying after SSM warm-up delay..."

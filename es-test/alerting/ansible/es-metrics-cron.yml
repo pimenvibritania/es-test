@@ -1,11 +1,17 @@
 ---
-# Deploys a small cron script on every ES node that polls its own
-# _cluster/health and pushes a custom CloudWatch metric (ClusterHealthStatus,
-# namespace EsTest/Custom). This is what the CloudWatch alarm in
-# ../terraform/main.tf actually alarms on -- CloudWatch has no native
-# visibility into ES's internal health otherwise.
+# Deploys a small cron script on every ES node that:
+#   1. polls its own _cluster/health and pushes a custom CloudWatch metric
+#      (ClusterHealthStatus, namespace EsTest/Custom) -- this is what the
+#      CloudWatch alarm in ../terraform/main.tf actually alarms on, since
+#      CloudWatch has no native visibility into ES's internal health.
+#   2. ALSO self-indexes a metrics document (cluster status, per-node CPU/
+#      heap/disk, doc count) into es-test-metrics-* on the cluster itself,
+#      purely from ES's own _nodes/stats + _cluster/health APIs (no extra
+#      agent/Beats needed) -- this is what feeds the Kibana dashboard
+#      provisioned by ../../monitoring/ansible/kibana-dashboards.yml, so
+#      Kibana isn't empty on first login.
 
-- name: Deploy ES cluster health -> CloudWatch metric cron
+- name: Deploy ES cluster health -> CloudWatch metric + self-index metrics cron
   hosts: es_nodes
   become: true
   vars:
@@ -13,7 +19,7 @@
     secret_arn: "{{ es_secret_arn }}"
 
   tasks:
-    - name: Fetch elastic user password (needed to query _cluster/health)
+    - name: Fetch elastic user password (needed to query ES stats APIs)
       command: >
         aws secretsmanager get-secret-value --secret-id {{ secret_arn }}
         --region {{ aws_region }} --query SecretString --output text
@@ -21,7 +27,7 @@
       changed_when: false
       no_log: true
 
-    - name: Write cluster-health-to-cloudwatch script
+    - name: Write cluster-health-to-cloudwatch + self-index-metrics script
       copy:
         dest: /usr/local/bin/es-health-metric.sh
         mode: "0700"
@@ -33,10 +39,17 @@
           # stops running/reporting, the CloudWatch alarm's
           # treat_missing_data=breaching will fire on its own after a couple
           # of missed periods, so a dead node doesn't go silently unmonitored.
+          #
+          # Also self-indexes a metrics doc into es-test-metrics-* so the
+          # Kibana dashboard has data to show (see python3 helper below --
+          # avoids shelling out to jq for nested JSON math like percentages).
           set -euo pipefail
 
-          STATUS=$(curl -sk -u "elastic:{{ elastic_pw.stdout }}" https://localhost:9200/_cluster/health \
-            | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])" 2>/dev/null || echo "unknown")
+          ES_URL="https://localhost:9200"
+          AUTH="elastic:{{ elastic_pw.stdout }}"
+
+          HEALTH_JSON=$(curl -sk -u "$AUTH" "$ES_URL/_cluster/health")
+          STATUS=$(echo "$HEALTH_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
 
           case "$STATUS" in
             green)  VALUE=0 ;;
@@ -51,6 +64,53 @@
             --metric-name ClusterHealthStatus \
             --value "$VALUE" \
             --unit None
+
+          # --- self-index metrics doc (best-effort: never fail the cron job
+          # over this -- CloudWatch alerting above is the critical path) ---
+          NODE_STATS_JSON=$(curl -sk -u "$AUTH" "$ES_URL/_nodes/_local/stats/os,jvm,fs" 2>/dev/null || echo "{}")
+          COUNT_JSON=$(curl -sk -u "$AUTH" "$ES_URL/_count" 2>/dev/null || echo "{}")
+
+          python3 - "$HEALTH_JSON" "$NODE_STATS_JSON" "$COUNT_JSON" <<'PYEOF' || true
+          import json, sys, subprocess, datetime
+
+          health = json.loads(sys.argv[1] or "{}")
+          stats = json.loads(sys.argv[2] or "{}")
+          count = json.loads(sys.argv[3] or "{}")
+
+          status_code = {"green": 0, "yellow": 1, "red": 2}.get(health.get("status"), 2)
+
+          nodes = stats.get("nodes", {})
+          node_info = next(iter(nodes.values()), {})
+          node_name = node_info.get("name", "unknown")
+          cpu_percent = node_info.get("os", {}).get("cpu", {}).get("percent", 0)
+          heap_used_percent = node_info.get("jvm", {}).get("mem", {}).get("heap_used_percent", 0)
+
+          fs_total = node_info.get("fs", {}).get("total", {})
+          total_bytes = fs_total.get("total_in_bytes", 0) or 1
+          free_bytes = fs_total.get("free_in_bytes", 0)
+          disk_free_percent = round((free_bytes / total_bytes) * 100, 2)
+
+          doc = {
+              "@timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+              "cluster_status": health.get("status", "unknown"),
+              "cluster_status_code": status_code,
+              "number_of_nodes": health.get("number_of_nodes", 0),
+              "node_name": node_name,
+              "cpu_percent": cpu_percent,
+              "heap_used_percent": heap_used_percent,
+              "disk_free_percent": disk_free_percent,
+              "docs_count": count.get("count", 0),
+          }
+
+          index_name = "es-test-metrics-" + datetime.date.today().isoformat()
+          subprocess.run(
+              ["curl", "-sk", "-u", "elastic:{{ elastic_pw.stdout }}", "-X", "POST",
+               f"https://localhost:9200/{index_name}/_doc",
+               "-H", "Content-Type: application/json",
+               "-d", json.dumps(doc)],
+              check=False,
+          )
+          PYEOF
       no_log: true
 
     - name: Install cronie (crontab not present on this minimal AMI build)
@@ -66,11 +126,39 @@
 
     - name: Install cron job (every minute)
       cron:
-        name: "ES cluster health -> CloudWatch metric"
+        name: "ES cluster health -> CloudWatch metric + self-index"
         minute: "*/1"
         job: "/usr/local/bin/es-health-metric.sh >> /var/log/es-health-metric.log 2>&1"
         user: root
 
+    - name: Create index template for es-test-metrics-* (proper field types for Kibana viz, must exist before first write)
+      uri:
+        url: "https://localhost:9200/_index_template/es-test-metrics"
+        method: PUT
+        validate_certs: false
+        user: elastic
+        password: "{{ elastic_pw.stdout }}"
+        force_basic_auth: true
+        status_code: 200
+        body_format: json
+        body:
+          index_patterns: ["es-test-metrics-*"]
+          template:
+            mappings:
+              properties:
+                "@timestamp": { type: "date" }
+                cluster_status: { type: "keyword" }
+                cluster_status_code: { type: "integer" }
+                number_of_nodes: { type: "integer" }
+                node_name: { type: "keyword" }
+                cpu_percent: { type: "float" }
+                heap_used_percent: { type: "float" }
+                disk_free_percent: { type: "float" }
+                docs_count: { type: "long" }
+      run_once: true
+      no_log: true
+
     - name: Run once now to verify it works end-to-end
       command: /usr/local/bin/es-health-metric.sh
       changed_when: false
+

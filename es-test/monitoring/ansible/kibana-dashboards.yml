@@ -1,0 +1,99 @@
+---
+# Provisions Kibana content so the UI isn't empty on first login:
+#   1. An index template + component template info is NOT needed here (that's
+#      handled by ../../alerting/ansible/es-metrics-cron.yml, which is what
+#      actually creates+writes the es-test-metrics-* indices this dashboard
+#      visualizes).
+#   2. Imports a fixed set of saved objects (1 index pattern, 5 visualizations,
+#      1 dashboard) into Kibana via its Saved Objects Import API. The ndjson
+#      bundle is static and checked into the repo (files/kibana-saved-objects.ndjson)
+#      -- it's just index-pattern/visualization/dashboard *definitions*, no
+#      secrets, so it's safe to commit and idempotent to re-import.
+#
+# Run this AFTER kibana.yml (Kibana must already be up) AND after
+# ../../alerting/ansible/es-metrics-cron.yml has run at least once on the ES
+# nodes (so the es-test-metrics-* index + docs already exist -- otherwise the
+# dashboard renders correctly but shows "no data" until the next cron tick).
+#
+# Uses the "elastic" superuser (not kibana_system) to call Kibana's own HTTP
+# API -- kibana_system is scoped for Kibana-to-ES traffic only and cannot
+# authenticate against Kibana's own login/API layer.
+
+- name: Provision Kibana dashboard + visualizations for ES cluster metrics
+  hosts: kibana
+  become: true
+  vars:
+    aws_region: "{{ kb_aws_region }}"
+    elastic_secret_arn: "{{ kb_elastic_secret_arn }}"  # elastic superuser password (Secrets Manager) -- needed to call Kibana's own API, not the ES connection
+
+  tasks:
+    - name: Fetch elastic user password from Secrets Manager
+      command: >
+        aws secretsmanager get-secret-value --secret-id {{ elastic_secret_arn }}
+        --region {{ aws_region }} --query SecretString --output text
+      register: elastic_pw
+      changed_when: false
+      no_log: true
+
+    - name: Copy saved-objects ndjson bundle onto the Kibana host
+      copy:
+        src: files/kibana-saved-objects.ndjson
+        dest: /tmp/kibana-saved-objects.ndjson
+        mode: "0600"
+
+    - name: Wait for Kibana HTTP API to be ready (belt-and-suspenders alongside kibana.yml's own check)
+      uri:
+        url: "http://localhost:5601/api/status"
+        status_code: 200
+      register: kb_ready
+      retries: 30
+      delay: 5
+      until: kb_ready.status is defined and kb_ready.status == 200
+
+    - name: Import saved objects (index pattern + visualizations + dashboard), overwriting on re-run for idempotency
+      # multipart/form-data upload is what Kibana's _import endpoint expects;
+      # the uri module's `src` param builds that from a file on the target host,
+      # which is why the ndjson is copied to /tmp above first.
+      uri:
+        url: "http://localhost:5601/api/saved_objects/_import?overwrite=true"
+        method: POST
+        user: elastic
+        password: "{{ elastic_pw.stdout }}"
+        force_basic_auth: true
+        headers:
+          kbn-xsrf: "true"
+        body_format: form-multipart
+        body:
+          file:
+            filename: kibana-saved-objects.ndjson
+            file: /tmp/kibana-saved-objects.ndjson
+            mime_type: application/ndjson
+        status_code: 200
+      register: import_result
+      no_log: true
+
+    - name: Clean up temp ndjson file from the host
+      file:
+        path: /tmp/kibana-saved-objects.ndjson
+        state: absent
+
+    - name: Report import result
+      debug:
+        msg: "Saved objects import success={{ import_result.json.success | default('unknown') }}, imported={{ import_result.json.successCount | default('?') }}"
+
+    - name: Set the dashboard as the default Kibana landing page
+      uri:
+        url: "http://localhost:5601/api/kibana/settings/defaultRoute"
+        method: POST
+        user: elastic
+        password: "{{ elastic_pw.stdout }}"
+        force_basic_auth: true
+        headers:
+          kbn-xsrf: "true"
+        body_format: json
+        body:
+          value: "/app/dashboards#/view/es-test-dashboard"
+        status_code: 200
+      register: default_route_result
+      no_log: true
+      failed_when: false
