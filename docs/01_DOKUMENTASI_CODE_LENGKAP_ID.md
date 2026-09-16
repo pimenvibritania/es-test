@@ -171,7 +171,11 @@ File ini yang benar-benar menginstall dan mengonfigurasi ElasticSearch, dijalank
 2. Install repo Pritunl — **catatan risiko**: `gpgcheck: false` karena GPG key resmi Pritunl sudah tidak ter-publish di lokasi manapun yang dicoba (404 di semua mirror). Mitigasi: repo tetap via HTTPS (transport aman), tapi tidak ada package-level signature verification. Diterima sebagai risiko untuk environment demo, TIDAK untuk production tanpa perbaikan lebih lanjut.
 3. Start MongoDB + Pritunl service.
 4. Tunggu web UI Pritunl merespon (`/` bukan `/ping` — endpoint lama sudah 404 di versi terbaru).
-5. Setup admin awal (`pritunl default-password`, buat organisasi + user, download profil `.ovpn`) **sengaja manual** — ini satu-satunya bagian VPN yang butuh interaksi manusia karena workflow Pritunl memang dirancang begitu (generate credential VPN per-user via web UI), didokumentasikan di README.
+5. Setup admin awal, organisasi, server VPN, user, dan download profil `.ovpn` — **fully automated**, tidak ada langkah manual UI: `vpn/ansible/pritunl-provision.yml` menyalakan API Pritunl langsung via injeksi MongoDB (`auth_api: true` pada admin user), lalu memanggil REST API Pritunl (helper `vpn/ansible/files/pritunl_provision.py`, HMAC-signed) untuk membuat Organization + Server + User, start server, download profile `.ovpn` (endpoint tersembunyi `/data/<org_id>/<user_id>/<server_id>.key`, tidak ada di dokumentasi resmi Pritunl — ditemukan via trace source code langsung di instance), dan menyimpan semuanya (admin password, API token/secret, profile `.ovpn` base64) ke HashiCorp Vault (`kv/pritunl`). Jalankan setelah `pritunl.yml`:
+   ```bash
+   ansible-playbook -i inventory.ini pritunl-provision.yml
+   ```
+
 
 ---
 
@@ -273,8 +277,61 @@ Urutan **destroy** adalah kebalikan persis (alerting → monitoring → vpn → 
 
 Sebagai shortcut, `~/vault/recreate-all.sh` di sisi operator menjalankan keempat stack sekaligus dalam urutan yang benar via satu command (dipakai untuk memvalidasi full destroy→recreate dari akun AWS kosong pada sesi ini).
 
-### Satu langkah manual per stack (tidak terhindarkan, bukan shortcut yang disengaja)
+### Satu langkah manual (tidak terhindarkan, bukan shortcut yang disengaja)
 - **Stack alerting**: setelah `deploy.sh` selesai, AWS mengirim email Subscription Confirmation link ke alamat email alert — pipeline alarm belum akan mengirim notifikasi apapun sampai link itu diklik. Tidak ada AWS API untuk auto-confirm subscription SNS email tanpa memiliki akses ke mailbox tersebut.
-- **Stack VPN**: login admin Pritunl pertama kali (set password admin awal, buat org/user, download profile `.ovpn`) dilakukan sekali lewat web UI Pritunl setelah `deploy.sh` selesai dan mencetak public IP + hint `sudo pritunl default-password`. Workflow Pritunl sendiri memang didesain untuk langkah ini dilakukan manusia.
 
-Selain dua hal di atas, **semuanya** — pembuatan infra, install software, generate cert TLS, generate/rotasi password, cron job, wiring alarm/topic — fully automated end-to-end tanpa langkah manual apapun.
+Ini **satu-satunya** langkah manual di seluruh proyek. Stack VPN (Pritunl) **tidak lagi manual** — `vpn/ansible/pritunl-provision.yml` mengotomasi seluruh setup admin, organisasi, server, user, dan download profile `.ovpn` via REST API (lihat detail di STAGE 2 di atas).
+
+Selain hal di atas, **semuanya** — pembuatan infra, install software, generate cert TLS, generate/rotasi password, cron job, wiring alarm/topic, dan setup VPN — fully automated end-to-end tanpa langkah manual apapun.
+
+---
+
+## Cara Mengakses ES + Kibana (setelah semua stack di-deploy)
+
+Satu-satunya jalur akses eksternal ke ES/Kibana secara by-design adalah **VPN Pritunl** — keduanya tidak pernah diexpose ke internet publik.
+
+### 1. Connect ke VPN
+```bash
+# ambil profile .ovpn (base64) dari Vault operator
+vault kv get -field=ovpn_profile_b64 kv/pritunl | base64 -d > client.ovpn
+# import ke OpenVPN client (Tunnelblick/OpenVPN Connect/NetworkManager) dan connect
+```
+Setelah connect, kamu masuk ke VPC private network (`10.1.0.0/16`) dan bisa langsung menjangkau IP privat semua node.
+
+### 2. Elasticsearch — HTTPS, TLS self-signed, port 9200, 3 node
+```
+https://<ip-privat-node-0>:9200
+https://<ip-privat-node-1>:9200
+https://<ip-privat-node-2>:9200
+```
+(IP privat aktual: lihat `terraform output` di `es-test/terraform/` atau `ansible/inventory.ini` hasil generate.)
+
+Auth basic (`elastic` superuser), password di Secrets Manager:
+```bash
+aws secretsmanager get-secret-value --secret-id elasticsearch/es-test/elastic-password \
+  --region ap-southeast-3 --query SecretString --output text
+```
+Contoh curl (`-k` skip verifikasi cert self-signed; download `elasticsearch/es-test/ca-bundle` dari Secrets Manager kalau mau full cert verification):
+```bash
+curl -k -u elastic:<password> https://<ip-privat-node-0>:9200/_cluster/health?pretty
+```
+
+**Registrasi endpoint di sisi aplikasi**: daftarkan **ketiga IP node**, bukan cuma satu — hampir semua ES client resmi (Python/Java/Node) mendukung multi-node list dan otomatis failover/round-robin ke node yang hidup kalau salah satu node down.
+```python
+from elasticsearch import Elasticsearch
+es = Elasticsearch(
+    ["https://<ip-node-0>:9200", "https://<ip-node-1>:9200", "https://<ip-node-2>:9200"],
+    basic_auth=("elastic", "<password_dari_secrets_manager>"),
+    verify_certs=False,
+)
+```
+Catatan: ketiga node punya role identik (`master`, `data`) — tidak ada pemisahan node khusus read vs write. Pembagian kerja read/write terjadi di level **shard** (primary shard menangani write lalu direplikasi; primary maupun replica shard bisa melayani read), bukan di level node — client bisa connect ke node manapun dan ES otomatis routing internal ke shard yang relevan.
+
+### 3. Kibana — HTTP plain (internal-only, aman karena hanya reachable via VPN), port 5601
+```
+http://<ip-privat-kibana>:5601
+```
+Login dengan user `elastic` + password yang sama (Kibana sendiri connect ke ES via service-account `kibana_system`, tapi login UI pakai `elastic`).
+
+Buka browser (harus dalam koneksi VPN aktif) → `http://<ip-privat-kibana>:5601` → login. Semua traffic ini murni internal VPC, zero exposure publik.
+
